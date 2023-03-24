@@ -9,34 +9,78 @@
 # license agreement from NVIDIA CORPORATION & AFFILIATES is strictly prohibited.
 
 from __future__ import annotations
-from contextlib import contextmanager
 from abc import ABC
 import numpy as np
 import torch
-import pycuda
 from glumpy import app, gloo, gl, ext
 import imgui
 from typing import Optional, Type, Callable, Dict, List, Tuple
 from kaolin.render.camera import Camera
 from wisp.framework import WispState, watch
 from wisp.renderer.core import RendererCore
+from wisp.renderer.core import cuda_register_gl_image, cuda_map_resource, cuda_2d_memcpy, cuda_unregister_resource
 from wisp.renderer.core.control import CameraControlMode, WispKey, WispMouseButton
 from wisp.renderer.core.control import FirstPersonCameraMode, TrackballCameraMode, TurntableCameraMode
+from wisp.renderer.core.api import add_pipeline_to_scene_graph
 from wisp.renderer.gizmos import Gizmo, WorldGrid, AxisPainter, PrimitivesPainter
-from wisp.renderer.gui import WidgetRendererProperties, WidgetGPUStats, WidgetSceneGraph, WidgetImgui
+from wisp.renderer.gui import WidgetInteractiveVisualizerProperties, WidgetGPUStats, WidgetSceneGraph, WidgetImgui
 
 
-@contextmanager
-def cuda_activate(img):
-    """Context manager simplifying use of pycuda.gl.RegisteredImage.
-        Boilerplate code based in part on pytorch-glumpy.
+def enable_amp(func):
+    """ An extension to @torch.cuda.amp.autocast which queries WispState to check if
+    mixed precision should be enabled.
     """
-    mapping = img.map()
-    yield mapping.array(0, 0)
-    mapping.unmap()
+    def _enable_amp(self: WispApp, *args, **kwargs):
+        with torch.cuda.amp.autocast(enabled=self.wisp_state.renderer.enable_amp):
+            return func(self, *args, **kwargs)
+    return _enable_amp
 
 
 class WispApp(ABC):
+    """ WispApp is a base app implementation which takes care of the entire lifecycle of the rendering loop:
+    this is the infinite queue of events which includes: handling of IO and OS events, rendering frames and running
+    backgrounds tasks, i.e. optimizations.
+
+    The app is initiated by calling the following functions:
+    - register_background_task(): Registers a task to run alternately with the render() function per
+      frame. Background tasks can be, i.e, functions that run a single optimization step for some neural object.
+    - run(): Initiates the rendering loop. This method blocks the calling thread until the window is closed.
+
+    Future custom interactive apps can subclass this base app, and inherit methods to customize the behaviour
+    of the app:
+    - init_wisp_state(): A hook for initializing the fields of the shared state object.
+        The interactive renderer configuration, scene graph and user custom fields can be initialized here.
+    - update_render_state(): A hook for updating the fields of the shared state object at the beginning of each
+      frame.
+    - create_widgets(): Controls which gui components the app uses
+    - create_gizmos(): Controls which transient canvas drawable components will be used (OpenGL based).
+    - default_user_mode(): The default camera controller mode (first person, trackball, turntable).
+    - register_event_handlers(): Registers which methods are invoked in response to app events / wisp state changes.
+
+    The rendering loop alternates between the following calls:
+    - on_idle, which invokes user background tasks, registered via register_background_task before calling run().
+    - on_draw, which invokes render() when it's time to draw a new frame
+
+    Internally, the app uses the RendererCore object to manage the drawing of all objects in the scene graph.
+    The app may request the RendererCore to switch into "interactive mode" to ensure the FPS remains interactive
+    (this is done at the expense of rendering quality).
+    Interactive mode is automatically initiated, i.e, during user interactions.
+
+    The render() logic is composed by the following sub-functions:
+    - update_render_state() - Updates the fields of the shared state object at the beginning of each frame.
+    - render_gui() - Renders the imgui components over the canvas, fromm scratch (imgui uses immediate mode gui).
+    - redraw() - A "heavier" function which forces the render-core to refresh its internal state.
+      Newly created objects may get added to the scene graph, and obsolete objects may get removed.
+      Vector-primitives data layers may regenerate here.
+    - render_canvas() - Invokes the render-core to obtain a RenderBuffer of the rendered scene objects.
+      The lion share of draw logic occurs within this call, in particular the drawing of neural objects.
+    - _blit_to_gl_renderbuffer - Copies the RenderBuffer results to the screen buffer.
+    - Gizmos are finally drawn directly to the screen framebuffer (as common OpenGL draw calls), these objects
+      are considered transient in the sense that they don't belong to the scene graph.
+    - Timer tick events may also get taken care of during the rendering loop (i.e: adjust velocity of user camera).
+    Users should rarely override these functions, unless they're sure about what they're doing.
+    Customizing the app behaviour should always be preferred via the initialization hooks.
+    """
 
     # Period of time between user interactions before resetting back to full resolution mode
     COOLDOWN_BETWEEN_RESOLUTION_CHANGES = 0.35  # In seconds
@@ -48,7 +92,7 @@ class WispApp(ABC):
 
         # Create main app window & initialize GL context
         # glumpy with a specialized glfw backend takes care of that (backend is imgui integration aware)
-        window = self._create_window(self.width, self.height, window_name)
+        window = self._create_window(self.width, self.height, window_name, gl_version=wisp_state.renderer.gl_version)
         self.register_io_mappings()
 
         # Initialize gui, assumes the window is managed by glumpy with glfw
@@ -57,9 +101,10 @@ class WispApp(ABC):
         self._is_imgui_hovered = False
         self._is_reposition_imgui_menu = True
         self.canvas_dirty = False
+        self.redraw_every_frame = False
 
-        # Note: Normally pycuda.gl.autoinit should be invoked here after the window is created,
-        # but wisp already initializes it when the library first loads. See wisp.__init__.py
+        # Tell torch to initialize the CUDA context
+        torch.cuda.init()
 
         # Initialize applicative renderer, which independently paints images for the main canvas
         render_core = RendererCore(self.wisp_state)
@@ -73,13 +118,22 @@ class WispApp(ABC):
         self._was_interacting_prev_frame = False
 
         # The initialization of these fields is deferred util "on_resize" is first prompted.
-        # There we generate a simple billboard GL program with a shared CUDA resource
+        # There we generate a simple billboard GL program (normally with a shared CUDA resource)
         # Canvas content will be blitted onto it
-        self.cuda_buffer: Optional[pycuda.gl.RegisteredImage] = None    # CUDA buffer, as a shared resource with OpenGL
-        self.depth_cuda_buffer: Optional[pycuda.gl.RegisteredImage] = None
-        self.canvas_program: Optional[gloo.Program] = None              # GL program used to paint a single billboard
+        self.canvas_program: Optional[gloo.Program] = None   # GL program used to paint a single billboard
+        self.cugl_rgb_handle = None                              # CUDA buffer, as a shared resource with OpenGL
+        self.cugl_depth_handle = None
 
-        self.user_mode: CameraControlMode = None
+        try:
+            # WSL does not support CUDA-OpenGL interoperability, fallback to device2host2device copy instead
+            from platform import uname
+            is_wsl = 'microsoft-standard' in uname().release
+            self.blitdevice2device = not is_wsl
+        except Exception:
+            # By default rendering results copy directly from torch/cuda mem to OpenGL Texture
+            self.blitdevice2device = True
+
+        self.user_mode: CameraControlMode = None    # Camera controller object (first person, trackball or turntable)
 
         self.widgets = self.create_widgets()        # Create gui widgets for this app
         self.gizmos = self.create_gizmos()          # Create canvas widgets for this app
@@ -88,27 +142,59 @@ class WispApp(ABC):
         self.register_event_handlers()
         self.change_user_mode(self.default_user_mode())
 
-        self.redraw()
+        self.redraw()   # Refresh RendererCore
+    
+    def add_pipeline(self, name, pipeline, transform=None):
+        """Register a neural fields pipeline into the scene graph.
+
+        Args:
+            name (str): The name of the pipeline.
+            pipeline (wisp.models.Pipeline): The pipeline holding a tracer and nef.
+            transform (wisp.core.ObjectTransform): The transform for the pipeline.
+        """
+        add_pipeline_to_scene_graph(self.wisp_state, name, pipeline, transform=transform)
+    
+    def add_widget(self, widget):
+        """ Adds a widget to the list of widgets.
+
+        Args:
+            widget (wisp.renderer.gui.imgui.WidgetImgui): The widget to add.
+        """
+        self.widgets.append(widget)
+
+    def add_gizmo(self, name, gizmo):
+        """Adds a gizmo to the list of gizmos.
+
+        Args:
+            name (str): The name of the gizmo.
+            gizmo (wisp.renderer.gizmos.Gizmo): The gizmo to add.
+        """
+        self.gizmos[name] = gizmo
 
     def init_wisp_state(self, wisp_state: WispState) -> None:
         """ A hook for applications to initialize specific fields inside the wisp state object.
-            This function is called before the entire renderer is constructed, hence initialized fields can
-            be defined to affect the behaviour of the renderer.
+        This function is called at the very beginning of WispApp initialization, hence the initialized fields can
+        be customized to affect the behaviour of the renderer.
         """
         # Channels available to view over the canvas
-        wisp_state.renderer.available_canvas_channels = ["RGB"]
-        wisp_state.renderer.selected_canvas_channel = "RGB"
+        wisp_state.renderer.available_canvas_channels = ["rgb", "depth"]
+        wisp_state.renderer.selected_canvas_channel = "rgb"
 
     def create_widgets(self) -> List[WidgetImgui]:
-        """ Override to define which widgets are used by the wisp app. """
-        return [WidgetGPUStats(), WidgetRendererProperties(), WidgetSceneGraph()]
+        """ Returns which widgets the gui will display, in order.
+        Override to define which gui widgets are used by the wisp app.
+        """
+        return [WidgetGPUStats(), WidgetInteractiveVisualizerProperties(), WidgetSceneGraph()]
 
     def create_gizmos(self) -> Dict[str, Gizmo]:
-        """ Override to define which gizmos are used by the wisp app. """
+        """ Override to define which gizmos are painted on the canvas by the wisp app.
+        Gizmos are transient rasterized objects rendered by OpenGL on top of the canvas.
+        For example: world grid, axes painter.
+        """
         gizmos = dict()
+        grid_size = 10.0
         planes = self.wisp_state.renderer.reference_grids
         axes = set(''.join(planes))
-        grid_size = 10.0
         for plane in planes:
             gizmos[f'world_grid_{plane}'] = WorldGrid(squares_per_axis=20, grid_size=grid_size,
                                                       line_color=(128, 128, 128), line_size=1, plane=plane)
@@ -120,7 +206,9 @@ class WispApp(ABC):
         return gizmos
 
     def default_user_mode(self) -> str:
-        """ Override to determine the default camera control mode """
+        """ Override to determine the default camera control mode.
+        Possible choices: 'First Person View', 'Turntable', 'Trackball'
+        """
         return "Turntable"
 
     def register_event_handlers(self) -> None:
@@ -159,13 +247,14 @@ class WispApp(ABC):
         self.canvas_dirty = True    # Request canvas redraw
 
     def run(self):
-        """ Initiate events message queue """
+        """ Initiate events message queue, which triggers the rendering loop.
+        This call will block the thread until the app window is closed.
+        """
         app.run()   # App clock should always run as frequently as possible (background tasks should not be limited)
 
-    def _create_window(self, width, height, window_name):
+    def _create_window(self, width, height, window_name, gl_version):
         # Currently assume glfw backend due to integration with imgui
-        app.use("glfw_imgui")
-
+        app.use(f"glfw_imgui ({gl_version})")
         win_config = app.configuration.Configuration()
         if self.wisp_state.renderer.antialiasing == 'msaa_4x':
             win_config.samples = 4
@@ -223,20 +312,27 @@ class WispApp(ABC):
         return canvas
 
     @staticmethod
-    def _create_cugl_shared_texture(res_h, res_w, channel_depth, map_flags=pycuda.gl.graphics_map_flags.WRITE_DISCARD,
-                                    dtype=np.uint8):
-        """ Create and return a Texture2D with gloo and pycuda views. """
+    def _create_screen_texture(res_h, res_w, channel_depth, dtype=np.uint8):
+        """ Create and return a Texture2D with gloo and a cuda handle. """
         if issubclass(dtype, np.integer):
             tex = np.zeros((res_h, res_w, channel_depth), dtype).view(gloo.Texture2D)
         elif issubclass(dtype, np.floating):
             tex = np.zeros((res_h, res_w, channel_depth), dtype).view(gloo.TextureFloat2D)
         else:
-            raise ValueError(f'_create_cugl_shared_texture invoked with unsupported texture dtype: {dtype}')
-        tex.activate()  # Force gloo to create on GPU
+            raise ValueError(f'_register_cugl_shared_texture invoked with unsupported texture dtype: {dtype}')
+        # Force gloo to create GL object on GPU
+        tex.activate()
         tex.deactivate()
-        cuda_buffer = pycuda.gl.RegisteredImage(int(tex.handle), tex.target,
-                                                map_flags)  # Create shared GL / CUDA resource
-        return tex, cuda_buffer
+        return tex
+
+    def _register_cugl_shared_texture(self, tex):
+        if self.blitdevice2device:
+            # Create shared GL / CUDA resource
+            handle = cuda_register_gl_image(image=int(tex.handle), target=tex.target)
+        else:
+            # No shared resource required, as we copy from cuda buffer -> cpu -> GL texture
+            handle = None
+        return handle
 
     def _reposition_gui_menu(self, menu_width, main_menu_height):
         window_height = self.window.height
@@ -246,6 +342,9 @@ class WispApp(ABC):
         self._is_reposition_imgui_menu = False
 
     def render_gui(self, state):
+        """ Render the entire gui window per frame (imgui works in immediate mode).
+            Internally, the Widgets take care of rendering the actual content.
+        """
         imgui.new_frame()
         if imgui.begin_main_menu_bar():
             main_menu_height = imgui.get_window_height()
@@ -281,6 +380,10 @@ class WispApp(ABC):
         imgui.render()
 
     def render_canvas(self, render_core, time_delta, force_render):
+        """ Invoke the render-core to render all neural fields and blend into a single Renderbuffer.
+        The rgb and depth channels passed on to the app.
+        """
+        # The render core returns a RenderBuffer
         renderbuffer = render_core.render(time_delta, force_render)
         buffer_attachment = renderbuffer.image().rgba
         buffer_attachment = buffer_attachment.flip([0])  # Flip y axis
@@ -292,30 +395,22 @@ class WispApp(ABC):
 
         return img, depth_img
 
-    def _blit_to_gl_renderbuffer(self, img, depth_img, canvas_program, cuda_buffer, depth_cuda_buffer, height):
-        shared_tex = canvas_program['tex']
-        shared_tex_depth = canvas_program['depth_tex']
+    def _blit_to_gl_renderbuffer(self, img, depth_img, canvas_program, cugl_rgb_handle, cugl_depth_handle, height):
+        if self.blitdevice2device:
+            # Device to device copy: Copy CUDA buffer to GL Texture mem
+            shared_tex = canvas_program['tex']
+            shared_tex_depth = canvas_program['depth_tex']
 
-        # copy from torch into buffer
-        assert shared_tex.nbytes == img.numel() * img.element_size()
-        assert shared_tex_depth.nbytes == depth_img.numel() * depth_img.element_size()    # TODO: using a 4d tex
-        cpy = pycuda.driver.Memcpy2D()
-        with cuda_activate(cuda_buffer) as ary:
-            cpy.set_src_device(img.data_ptr())
-            cpy.set_dst_array(ary)
-            cpy.width_in_bytes = cpy.src_pitch = cpy.dst_pitch = shared_tex.nbytes // height
-            cpy.height = height
-            cpy(aligned=False)
-        torch.cuda.synchronize()
-        # TODO (operel): remove double synchronize after depth debug
-        cpy = pycuda.driver.Memcpy2D()
-        with cuda_activate(depth_cuda_buffer) as ary:
-            cpy.set_src_device(depth_img.data_ptr())
-            cpy.set_dst_array(ary)
-            cpy.width_in_bytes = cpy.src_pitch = cpy.dst_pitch = shared_tex_depth.nbytes // height
-            cpy.height = height
-            cpy(aligned=False)
-        torch.cuda.synchronize()
+            # copy from torch into buffer
+            assert shared_tex.nbytes == img.numel() * img.element_size()
+            assert shared_tex_depth.nbytes == depth_img.numel() * depth_img.element_size()    # TODO: using a 4d tex
+            cuda_2d_memcpy(resource_handle=cugl_rgb_handle, shared_tex=shared_tex, img=img, height=height)
+            cuda_2d_memcpy(resource_handle=cugl_depth_handle, shared_tex=shared_tex_depth, img=depth_img, height=height)
+            torch.cuda.synchronize()
+        else:
+            # Device to host to device copy: Move torch tensors to cpu and upload as texture data
+            canvas_program['tex'] = img.cpu().numpy()
+            canvas_program['depth_tex'] = depth_img.cpu().numpy()
 
         canvas_program.draw(gl.GL_TRIANGLE_STRIP)
 
@@ -332,6 +427,7 @@ class WispApp(ABC):
         wisp_state.renderer.cam_controller = type(self.user_mode)
 
     def change_user_mode(self, user_mode: str):
+        """ Changes the camera controller mode """
         if user_mode == 'Trackball':
             self.wisp_state.renderer.cam_controller = TrackballCameraMode
         elif user_mode == 'First Person View':
@@ -340,7 +436,14 @@ class WispApp(ABC):
             self.wisp_state.renderer.cam_controller = TurntableCameraMode
 
     @torch.no_grad()
+    @enable_amp
     def redraw(self):
+        """ Asks the render core to redraw the scene:
+        - The scene graph will be refreshed (new objects added will create their renderers if needed)
+        - Data layers will regenerate according to up-to-date state.
+        render() may internally invoke redraw() when the canvas is tagged as "dirty".
+        A render() call is required to display changes caused by redraw() on the canvas.
+        """
         # Let the renderer redraw the data layers if needed
         self.render_core.redraw()
 
@@ -349,7 +452,9 @@ class WispApp(ABC):
         self.prim_painter.redraw(layers_to_draw)
 
     @torch.no_grad()
+    @enable_amp
     def render(self):
+        """ Renders a single frame. """
         dt = self.render_clock.tick()  # Tick render clock: dt is now the exact time elapsed since last render
 
         # Populate the scene state with the most recent information about the interactive renderer.
@@ -363,6 +468,10 @@ class WispApp(ABC):
         # imgui renders first
         self.render_gui(self.wisp_state)
 
+        if self.redraw_every_frame:
+            self.canvas_dirty = True
+
+        # The app was asked to redraw the scene, inform the render core
         if self.canvas_dirty:
             self.redraw()
 
@@ -370,7 +479,8 @@ class WispApp(ABC):
         # of the user which involve the time elapsed (i.e: velocity, acceleration of movements).
         self.user_mode.handle_timer_tick(dt)
 
-        if self.user_mode.is_interacting() or self._is_imgui_hovered:
+        # Toggle interactive mode on or off if needed to maintain interactive FPS rate
+        if self.user_mode.is_interacting():
             self.render_core.set_low_resolution()
         else:
             # Allow a fraction of a second before turning full resolution on.
@@ -387,10 +497,10 @@ class WispApp(ABC):
         # output is rendered on a Renderbuffer object, backed by torch tensors
         img, depth_img = self.render_canvas(self.render_core, dt, self.canvas_dirty)
 
-        # glumpy code injected within the pyimgui render loop to blit the rendercore output to the actual canvas
-        # The torch buffers are copied by pycuda to CUDA buffers, connected as shared resources as 2d GL textures
-        self._blit_to_gl_renderbuffer(img, depth_img, self.canvas_program, self.cuda_buffer,
-                                      self.depth_cuda_buffer, self.height)
+        # glumpy code injected within the pyimgui render loop to blit the renderer core output to the actual canvas
+        # The torch buffers are copied by with cuda, connected as shared resources as 2d GL textures
+        self._blit_to_gl_renderbuffer(img, depth_img, self.canvas_program, self.cugl_rgb_handle,
+                                      self.cugl_depth_handle, self.height)
 
         # Finally, render OpenGL gizmos on the canvas.
         # This may include the world grid, or vectorial lines / points belonging to data layers
@@ -401,12 +511,18 @@ class WispApp(ABC):
         self.canvas_dirty = False
 
     def register_background_task(self, hook: Callable[[], None]) -> None:
-        def _run_hook(dt: float):
-            if not self.wisp_state.renderer.background_tasks_paused:
-                hook()
-        self.window.on_idle = _run_hook
+        """ Register a new callable function to run in conjunction with the rendering loop.
+            The app will alternate between on_idle calls, invoking the background task, and on_draw
+            calls, invoking the rendering itself, both occurring on the same thread.
+        """
+        if hook is not None:
+            def _run_hook(dt: float):
+                if not self.wisp_state.renderer.background_tasks_paused:
+                    hook()
+            self.window.on_idle = _run_hook
 
     def on_draw(self, dt=None):
+        """ glumpy's event to draw the next frame. Invokes the render() function if needed. """
         # dt arg comes from the app clock, the renderer clock is maintained separately from the background tasks
         # Interactive mode on, or interaction have just started
         is_interacting = self.wisp_state.renderer.interactive_mode or self.user_mode.is_interacting()
@@ -421,17 +537,23 @@ class WispApp(ABC):
         return False
 
     def on_resize(self, width, height):
+        """ Invoked when the window is first created, or resized.
+        A resize causes internal textures and buffers to regenerate according the window size.
+        """
         self.width = width
         self.height = height
 
-        # Handle pycuda shared resources
-        if self.cuda_buffer is not None:
-            del self.cuda_buffer    # TODO(operel): is this proper pycuda deallocation?
-            del self.depth_cuda_buffer
-        tex, cuda_buffer = self._create_cugl_shared_texture(height, width, self.channel_depth)
-        depth_tex, depth_cuda_buffer = self._create_cugl_shared_texture(height, width, 4, dtype=np.float32)   # TODO: Single channel
-        self.cuda_buffer = cuda_buffer
-        self.depth_cuda_buffer = depth_cuda_buffer
+        # Handle deallocation of shared resources
+        if self.cugl_rgb_handle is not None:
+            cuda_unregister_resource(self.cugl_rgb_handle)
+            self.cugl_rgb_handle = None
+        if self.cugl_depth_handle is not None:
+            cuda_unregister_resource(self.cugl_depth_handle)
+            self.cugl_depth_handle = None
+        tex = self._create_screen_texture(height, width, self.channel_depth, dtype=np.uint8)
+        depth_tex = self._create_screen_texture(height, width, 4, dtype=np.float32)  # TODO: Single channel
+        self.cugl_rgb_handle = self._register_cugl_shared_texture(tex)
+        self.cugl_depth_handle = self._register_cugl_shared_texture(depth_tex)
         if self.canvas_program is None:
             self.canvas_program = self._create_gl_depth_billboard_program(texture=tex, depth_texture=depth_tex)
         else:
@@ -475,30 +597,41 @@ class WispApp(ABC):
 
     @property
     def width(self):
+        """ Returns the canvas width """
         return self.wisp_state.renderer.canvas_width
 
     @width.setter
     def width(self, value: int):
+        """ Sets the canvas width """
         self.wisp_state.renderer.canvas_width = value
 
     @property
     def height(self):
+        """ Returns the canvas height """
         return self.wisp_state.renderer.canvas_height
 
     @height.setter
     def height(self, value: int):
+        """ Sets the canvas height """
         self.wisp_state.renderer.canvas_height = value
 
     @property
     def channel_depth(self):
+        """ Returns the number of channels the screenbuffer uses for the color attachment """
         return 4  # Assume the framebuffer keeps RGBA
 
     @property
     def canvas_dirty(self):
+        """ Returns if the canvas is dirty,
+        that is, the app requires a redraw() to stay in sync with external changes
+        """
         return self.wisp_state.renderer.canvas_dirty
 
     @canvas_dirty.setter
     def canvas_dirty(self, value: bool):
+        """ Marks the canvas as dirty,
+        implying the app requires a redraw() to stay in sync with external changes
+        """
         self.wisp_state.renderer.canvas_dirty = value
 
     def _update_imgui_keys(self, symbol):
@@ -573,6 +706,8 @@ class WispApp(ABC):
             self.user_mode.handle_key_release(symbol, modifiers)
 
     def dump_framebuffer(self, path='./framebuffer'):
+        # Dumps debug images of the GL screen framebuffer.
+        # This framebuffer should reflect the exact content of the window.
         framebuffer = np.zeros((self.width, self.height * 3), dtype=np.uint8)
         gl.glReadPixels(0, 0, self.width, self.height,
                         gl.GL_RGB, gl.GL_UNSIGNED_BYTE, framebuffer)
@@ -584,7 +719,6 @@ class WispApp(ABC):
                         gl.GL_DEPTH_COMPONENT, gl.GL_FLOAT, framebuffer)
         framebuffer = np.flip(framebuffer, 0)
         ext.png.from_array(framebuffer, 'L').save(path + '_depth.png')
-
 
     def register_io_mappings(self):
         WispMouseButton.register_symbol(WispMouseButton.LEFT_BUTTON, app.window.mouse.LEFT)
