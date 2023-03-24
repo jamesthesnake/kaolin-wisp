@@ -9,17 +9,16 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional, Dict, Set, Tuple
+from typing import Optional, Dict, Set, Tuple, Any
 import torch
 from kaolin.render.camera import Camera
-from wisp.core import RenderBuffer, Rays, PrimitivesPack
-from wisp.models import Pipeline
-from wisp.models.nefs import BaseNeuralField
-from wisp.gfx.datalayers import Datalayers
+from wisp.core import RenderBuffer, Rays, PrimitivesPack, WispModule
 
 
 @dataclass
 class FramePayload:
+    """This is a dataclass which holds metadata for the current frame.
+    """
     camera: Camera
     visible_objects: Set[str]
     interactive_mode: bool
@@ -27,13 +26,13 @@ class FramePayload:
     render_res_y: int
     time_delta: float   # In seconds
     clear_color: Tuple[float, float, float]
+    channels: Set[str] # Channels requested for the render.
 
 
-class BottomLevelRenderer(ABC):
+class BottomLevelRenderer(WispModule, ABC):
 
     def __init__(self, *args, **kwargs):
-        self._model_matrix = None
-        self._bbox = None
+        super().__init__()
         self._data_layers = dict()
 
     def pre_render(self, payload: FramePayload, *args, **kwargs) -> None:
@@ -44,6 +43,7 @@ class BottomLevelRenderer(ABC):
         pass
 
     def needs_refresh(self, payload: FramePayload, *args, **kwargs) -> bool:
+        """ Override to optimize cases when the neural field does not require rendering from scratch. """
         return True
 
     @abstractmethod
@@ -81,65 +81,22 @@ class BottomLevelRenderer(ABC):
     def dtype(self) -> torch.dtype:
         raise NotImplementedError('BottomLevelRenderer subclasses must implement dtype')
 
-    @property
-    @abstractmethod
-    def model_matrix(self) -> torch.Tensor:
-        """ torch.Tensor of 4x4 matrix defining how the object local coordinates should transform to world coordinates.
-        """
-        raise NotImplementedError('BottomLevelRenderer subclasses must implement model_matrix() logic.')
-
-    @property
-    @abstractmethod
-    def aabb(self) -> torch.Tensor:
-        """ torch.Tensor defining the axis-aligned bounding box of object as:
-            (center_x, center_y, center_z, width, height, depth) """
-        raise NotImplementedError('BottomLevelRenderer subclasses must implement bbox() logic.')
-
-
-class RayTracedRenderer(BottomLevelRenderer):
-    def __init__(self, nef: BaseNeuralField, *args, **kwargs):
-        super().__init__(nef, *args, **kwargs)
-        self.nef = nef.eval()
-        self.layers_painter = self.create_layers_painter(self.nef)
-
-    @classmethod
-    def from_pipeline(cls, pipeline: Pipeline, *args, **kwargs):
-        """ Builds a bottom level renderer from the building block of a pipeline. """
-        # Build the renderer using the pipeline's tracer args
-        # The renderer is protected against extra **kwargs that may exist inside the tracer
-        tracer_args = pipeline.tracer.__dict__
-
-        # Allow the constructor to override the tracer's args with **kwargs specified manually
-        tracer_args.update(**kwargs)
-        return cls(nef=pipeline.nef, *args, **tracer_args)
-
-    @classmethod
-    @abstractmethod
-    def create_layers_painter(cls, nef: BaseNeuralField) -> Optional[Datalayers]:
+    def acceleration_structure(self) -> Optional[str]:
+        """ Returns a descriptive name of the acceleration structure used by this object, if applicable. """
         return None
 
-    def needs_redraw(self) -> bool:
-        if self.layers_painter is not None:
-            return self.layers_painter.needs_redraw(self.nef.grid)
-        else:
-            return True
+    def features_structure(self) -> Optional[str]:
+        """ Returns a descriptive name of the feature structure used by this object, if applicable. """
+        return None
 
-    def regenerate_data_layers(self) -> Dict[str, PrimitivesPack]:
-        if self.layers_painter is not None:
-            return self.layers_painter.regenerate_data_layers(self.nef.grid)
-        else:
-            return dict()
+    def public_properties(self) -> Dict[str, Any]:
+        """ Wisp modules expose their public properties in a dictionary.
+        The purpose of this method is to give an easy table of outwards facing attributes,
+        for the purpose of logging, gui apps, etc.
 
-    def pre_render(self, payload: FramePayload, *args, **kwargs) -> None:
-        """ Prepare primary rays to render """
-        pass
-
-    @abstractmethod
-    def render(self, rays: Optional[Rays] = None) -> RenderBuffer:
-        pass
-
-    def post_render(self) -> None:
-        pass
+        BLASGrids are generally assumed to contain a bottom level acceleration structure.
+        """
+        return dict()
 
 
 class RasterizedRenderer(BottomLevelRenderer):

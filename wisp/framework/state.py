@@ -14,7 +14,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from kaolin.render.camera import Camera
 from wisp.framework.event import watchedfields
-from wisp.core import Channel, PrimitivesPack, channels_starter_kit
+from wisp.core import Channel, PrimitivesPack, ObjectTransform, channels_starter_kit
 if TYPE_CHECKING:  # Prevent circular imports mess due to typed annotations
     from wisp.models import Pipeline
     from wisp.renderer.core.control import CameraControlMode
@@ -114,6 +114,15 @@ class InteractiveRendererState:
         'none' - No inherent antialising mode will be activated.
     """
 
+    gl_version: str = "GL 3.3"
+    """ Wisp applications rely on glumpy + OpenGL to render specific features and blit content to the window.
+    This setting configures glumpy to load with a specific OpenGL backend.
+    OpenGL 3.3 is widely supported and is therefore assumed to be the default.
+    Users are free to bump this version to a higher number in case more advanced OpenGL capabilities are required.
+    Format: (api major.minor. profile)
+    For example: "GL 3.3 core"  
+    """
+
     reference_grids: List[str] = field(default_factory=list)
     """ List of world grids to use as reference planes, for both rendering and some camera controllers.
         Choices: Any combination of the values: 'xy', 'xz', 'yz'. An empty list will turn off the grid.
@@ -122,6 +131,12 @@ class InteractiveRendererState:
     device: torch.device = 'cpu'
     """ Default device for interactive renderer and bottom level renderers to use """
 
+    enable_amp: bool = True
+    """ Enables mixed precision with torch.cuda.amp.autocast on the interactive renderer's redraw() and render()
+    functions. By default, this setting is enabled to allow for faster optimized rendering.
+    Users with custom tracers or neural fields may opt to turn this off if for some reason their pipelines do not
+    support mixed precision.  
+    """
 
 @watchedfields
 @dataclass
@@ -139,6 +154,12 @@ class BottomLevelRendererState:
 
     data_layers: Dict[str, PrimitivesPack] = field(default_factory=dict)  # layer id -> prims
     toggled_data_layers: Dict[str, bool] = field(default_factory=dict)    # layer id -> bool
+
+    transform: ObjectTransform = ObjectTransform()
+    """ The object transform maintains the 4x4 model matrix, which describes the object transformation from
+        local object coordinates to world space.
+        Manipulating the transform results in moving, scaling and orienting the object.
+    """
 
     ### Lifecycle fields ###
 
@@ -161,8 +182,8 @@ class SceneGraphState:
     """
     neural_pipelines: Dict[str, Pipeline] = field(default_factory=dict)
     """ Wisp objects are represented by neural pipelines which pair a BaseNeuralField and a BaseTracer.
-        The full pipeline 
-        A BottomLevelRenderer knows how to invoke the rendering nerf and obtain a Renderbuffer of the object. 
+        A BottomLevelRenderer knows how to invoke the pipeline to render the nef and obtain a 
+        Renderbuffer of the object. 
     """
 
     bl_renderers: Dict[str, BottomLevelRendererState] = field(default_factory=dict)

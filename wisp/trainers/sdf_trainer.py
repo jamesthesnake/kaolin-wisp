@@ -6,20 +6,10 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION & AFFILIATES is strictly prohibited.
 
-import os
-import sys
-import numpy as np
-import torch
-
-import argparse
-import glob
 import logging as log
-
-
-from wisp.trainers import BaseTrainer
-from torch.utils.data import DataLoader
-from wisp.utils import PerfTimer
-from wisp.datasets import SDFDataset
+import torch
+from wisp.trainers import BaseTrainer, log_metric_to_wandb, log_images_to_wandb
+from wisp.datasets import MeshSampledSDFDataset, OctreeSampledSDFDataset, SDFBatch
 from wisp.ops.sdf import compute_sdf_iou
 from wisp.ops.image import hwc_to_chw
 
@@ -29,19 +19,19 @@ class SDFTrainer(BaseTrainer):
     def init_log_dict(self):
         """Custom logging dictionary.
         """
-        self.log_dict['total_loss'] = 0
-        self.log_dict['total_iter_count'] = 0
+        super().init_log_dict()
         self.log_dict['rgb_loss'] = 0
         self.log_dict['l2_loss'] = 0
 
-    def step(self, epoch, n_iter, data):
+    @torch.cuda.nvtx.range("SDFTrainer.step")
+    def step(self, data: SDFBatch):
         """Implement training from ground truth TSDF.
         """
         # Map to device
-        pts = data[0].to(self.device)
-        gts = data[1].to(self.device)
+        pts = data['coords'].to(self.device)
+        gts = data['sdf'].to(self.device)
         if self.extra_args["sample_tex"]:
-            rgb = data[2].to(self.device) 
+            rgb = data['rgb'].to(self.device)
 
         # Prepare for inference
         batch_size = pts.shape[0]
@@ -84,53 +74,49 @@ class SDFTrainer(BaseTrainer):
 
         # Update logs
         self.log_dict['l2_loss'] += _l2_loss.item()
-        self.log_dict['total_loss'] += loss.item() * batch_size
-        self.log_dict['total_iter_count'] += batch_size
+        self.log_dict['total_loss'] += loss.item() 
 
         # Backpropagate
-        loss.backward()
-        self.optimizer.step()
+        with torch.cuda.nvtx.range("SDFTrainer.backward"):
+            loss.backward()
+            self.optimizer.step()
 
-    def log_tb(self, epoch):
+    def log_cli(self):
         """Override logging.
         """
-        log_text = 'EPOCH {}/{}'.format(epoch, self.num_epochs)
-        self.log_dict['total_loss'] /= self.log_dict['total_iter_count'] + 1e-6
-        log_text += ' | total loss: {:>.3E}'.format(self.log_dict['total_loss'])
-        self.log_dict['l2_loss'] /= self.log_dict['total_iter_count'] + 1e-6
-        log_text += ' | l2 loss: {:>.3E}'.format(self.log_dict['l2_loss'])
-        self.log_dict['rgb_loss'] /= self.log_dict['total_iter_count'] + 1e-6
-        log_text += ' | rgb loss: {:>.3E}'.format(self.log_dict['rgb_loss'])
-
-        self.writer.add_scalar('Loss/l2_loss', self.log_dict['l2_loss'], epoch)
-        self.writer.add_scalar('Loss/rgb_loss', self.log_dict['rgb_loss'], epoch)
+        log_text = 'EPOCH {}/{}'.format(self.epoch, self.max_epochs)
+        log_text += ' | total loss: {:>.3E}'.format(self.log_dict['total_loss'] / len(self.train_data_loader))
+        log_text += ' | l2 loss: {:>.3E}'.format(self.log_dict['l2_loss'] / len(self.train_data_loader))
+        log_text += ' | rgb loss: {:>.3E}'.format(self.log_dict['rgb_loss'] / len(self.train_data_loader))
         log.info(log_text)
 
-        # Log losses
-        self.writer.add_scalar('Loss/total_loss', self.log_dict['total_loss'], epoch)
-
-    def render_tb(self, epoch):
-        super().render_tb(epoch)
+    def render_tb(self):
+        super().render_tb()
 
         self.pipeline.eval()
-        for d in [self.extra_args["num_lods"] - 1]:
+        for d in [self.pipeline.nef.grid.num_lods - 1]:
             if self.extra_args["log_2d"]:
                 out_x = self.renderer.sdf_slice(self.pipeline.nef.get_forward_function("sdf"), dim=0)
                 out_y = self.renderer.sdf_slice(self.pipeline.nef.get_forward_function("sdf"), dim=1)
                 out_z = self.renderer.sdf_slice(self.pipeline.nef.get_forward_function("sdf"), dim=2)
-                self.writer.add_image(f'Cross-section/X/{d}', hwc_to_chw(out_x), epoch)
-                self.writer.add_image(f'Cross-section/Y/{d}', hwc_to_chw(out_y), epoch)
-                self.writer.add_image(f'Cross-section/Z/{d}', hwc_to_chw(out_z), epoch)
+                out_x = torch.FloatTensor(out_x)
+                out_y = torch.FloatTensor(out_y)
+                out_z = torch.FloatTensor(out_z)
+                self.writer.add_image(f'Cross-section/X/{d}', hwc_to_chw(out_x), self.epoch)
+                self.writer.add_image(f'Cross-section/Y/{d}', hwc_to_chw(out_y), self.epoch)
+                self.writer.add_image(f'Cross-section/Z/{d}', hwc_to_chw(out_z), self.epoch)
+                if self.using_wandb:
+                    log_images_to_wandb(f'Cross-section/X/{d}', hwc_to_chw(out_x), self.epoch)
+                    log_images_to_wandb(f'Cross-section/Y/{d}', hwc_to_chw(out_y), self.epoch)
+                    log_images_to_wandb(f'Cross-section/Z/{d}', hwc_to_chw(out_z), self.epoch)
 
-    def validate(self, epoch=0):
+    def validate(self):
         """Implement validation. Just computes IOU.
         """
-            
         # Same as training since we're overfitting
-        metric_name = None
-        if self.train_dataset.initialization_mode == "mesh":
+        if isinstance(self.train_dataset, MeshSampledSDFDataset):
             metric_name = "volumetric_iou"
-        elif self.train_dataset.intiialization_mode == "grid":
+        elif isinstance(self.train_dataset, OctreeSampledSDFDataset):
             metric_name = "narrowband_iou"
         else:
             raise NotImplementedError
@@ -141,22 +127,21 @@ class SDFTrainer(BaseTrainer):
         # Uniform points metrics
         for n_iter, data in enumerate(self.train_data_loader):
 
-            pts = data[0].to(self.device)
-            gts = data[1].to(self.device)
-            nrm = data[2].to(self.device) if self.extra_args["get_normals"] else None
-                
+            pts = data['coords'].to(self.device)
+            gts = data['sdf'].to(self.device)
+            nrm = data['normals'].to(self.device) if data.get('normals') is not None else None
 
             for lod_idx in self.loss_lods:
                 # TODO(ttakkawa): Currently the SDF metrics computed for sparse grid-based SDFs are not entirely proper
                 pred = self.pipeline.nef(coords=pts, lod_idx=lod_idx, channels="sdf")
                 val_dict[metric_name] += [float(compute_sdf_iou(pred, gts))]
 
-        log_text = 'EPOCH {}/{}'.format(epoch, self.num_epochs)
+        log_text = 'EPOCH {}/{}'.format(self.epoch, self.max_epochs)
 
         for k, v in val_dict.items():
             score_total = 0.0
             for lod, score in zip(self.loss_lods, v):
-                self.writer.add_scalar(f'Validation/{k}/{lod}', score, epoch+1)
+                self.writer.add_scalar(f'Validation/{k}/{lod}', score, self.epoch)
                 score_total += score
             log_text += ' | {}: {:.4f}'.format(k, score_total / len(v))
         log.info(log_text)

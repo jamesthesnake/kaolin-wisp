@@ -8,15 +8,12 @@
 
 from __future__ import annotations
 from typing import Callable, Dict, List
-from wisp.renderer.gui.imgui.widget_renderer_properties import WidgetRendererProperties
-from wisp.renderer.gui.imgui.widget_gpu_stats import WidgetGPUStats
-from wisp.renderer.gui.imgui.widget_scene_graph import WidgetSceneGraph
-from wisp.renderer.gui.imgui.widget_optimization import WidgetOptimization
-from wisp.renderer.gui.imgui.widget_imgui import WidgetImgui
+from wisp.renderer.gui import WidgetImgui
+from wisp.renderer.gui import WidgetInteractiveVisualizerProperties, WidgetGPUStats, WidgetSceneGraph, WidgetOptimization
 from wisp.renderer.gizmos.gizmo import Gizmo
 from wisp.renderer.app.wisp_app import WispApp
+from wisp.renderer.core.api import request_redraw
 from wisp.framework import WispState, watch
-from wisp.datasets import MultiviewDataset, SDFDataset
 
 
 class OptimizationApp(WispApp):
@@ -33,36 +30,23 @@ class OptimizationApp(WispApp):
 
     def init_wisp_state(self, wisp_state: WispState) -> None:
         """ A hook for applications to initialize specific fields inside the wisp state object.
-            This function is called before the entire renderer is constructed, hence initialized renderer fields can
-            be defined to affect the behaviour of the renderer.
+        This function is called at the very beginning of WispApp initialization, hence the initialized fields can
+        be customized to affect the behaviour of the renderer.
         """
         # Channels available to view over the canvas
-        wisp_state.renderer.available_canvas_channels = ["RGB", "Depth"]
-        wisp_state.renderer.selected_canvas_channel = "RGB"
+        wisp_state.renderer.available_canvas_channels = ["rgb", "depth"]
+        wisp_state.renderer.selected_canvas_channel = "rgb"
 
         # For this app, we'll use only a world grid which resides in the 'xz' plane.
         # This attribute will signal the renderer that some camera controllers should align with this plane,
         # as well as what gizmos (e.g: reference grids, axes) to draw on the canvas.
         wisp_state.renderer.reference_grids = ['xz']
 
-        # MultiviewDatasets come from images with a predefined background color.
-        # The following lines can be uncommented to initialize the renderer canvas background color
-        # to the train data bg color if it is black or white.
-        #
-        # train_sets = self.wisp_state.optimization.train_data
-        # if train_sets is not None and len(train_sets) > 0:
-        #     train_set = train_sets[0]
-        #     if isinstance(train_set, MultiviewDataset):
-        #         if train_set.bg_color == 'white':
-        #             wisp_state.renderer.clear_color_value = (1.0, 1.0, 1.0)
-        #         elif train_set.bg_color == 'black':
-        #             wisp_state.renderer.clear_color_value = (0.0, 0.0, 0.0)
-
     def create_widgets(self) -> List[WidgetImgui]:
-        """ Define the list of widgets the gui will display, in order. """
+        """ Returns the list of widgets the gui will display, in order. """
         return [WidgetGPUStats(),            # Current FPS, memory occupancy, GPU Model
                 WidgetOptimization(),        # Live status of optimization, epochs / iterations count, loss curve
-                WidgetRendererProperties(),  # Canvas dims, user camera controller & definitions
+                WidgetInteractiveVisualizerProperties(),  # Canvas dims, user camera controller & definitions
                 WidgetSceneGraph()]          # A scene graph tree of the entire hierarchy of objects in the scene
                                              # and their properties
 
@@ -111,7 +95,7 @@ class OptimizationApp(WispApp):
         """ A custom event used by the optimization renderer.
             When an epoch ends, this handler is invoked to force a redraw() and render() of the canvas if needed.
         """
-        self.canvas_dirty = True
+        request_redraw(self.wisp_state)
 
         # Force render if target FPS is 0 (renderer only responds to specific events) or too much time have elapsed
         if self.is_time_to_render() or self.wisp_state.renderer.target_fps == 0:
