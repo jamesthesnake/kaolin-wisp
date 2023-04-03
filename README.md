@@ -65,7 +65,7 @@ The Wisp repository includes:
 * [examples](examples) - Smaller demos demonstrating specific features & use cases of Wisp.
   * [examples/latent_nerf](examples/latent_nerf) - demonstrates how to add a new NeuralField module, which exposess the latent dimensions as output & visualizes it.
   * [examples/spc_browser](examples/spc_browser) - an app for converting meshes to [Structured Point Clouds](https://kaolin.readthedocs.io/en/latest/notes/spc_summary.html), and visualizing them.
-
+s
 
 ### Configurations
 
